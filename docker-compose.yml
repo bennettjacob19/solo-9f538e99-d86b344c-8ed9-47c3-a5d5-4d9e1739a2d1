@@ -11,9 +11,14 @@ services:
     environment:
       GSB_SLOTS: "2"          # 并行轮数（槽位数）
       GSB_RESERVE_MIB: "96"   # 给 API 进程自身预留的内存
+      GSB_SIMULATE: "${GSB_SIMULATE:-0}"  # 1 = 模拟后端，不碰 /sys/fs/cgroup
+      GSB_SIM_LIMIT_MIB: "${GSB_SIM_LIMIT_MIB:-256}"
     # 要求：cgroup v2 宿主机 + Docker >= 20.10（默认 private cgroup 命名空间，
     # 容器内 /sys/fs/cgroup 可写）。老版本 Docker 若挂载为只读，需升级或
     # 以 --cgroupns=private 运行；本仓库不依赖 privileged。
+    #
+    # 模拟后端：GSB_SIMULATE=1 docker compose up --build
+    # 此时不依赖宿主机 cgroup，/status 的 mode 为 simulation，仍可正常接作业。
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/status')"]
       interval: 10s
@@ -28,3 +33,14 @@ services:
     depends_on:
       - oom-doctor
     command: ["python3", "scripts/selftest.py", "--base-url", "http://oom-doctor:8000"]
+
+  # GET /jobs 逐条发送自测（长列表、慢读、中途断开）：
+  #   docker compose run --rm streamtest
+  # 对已运行的服务做只读基础验证时，也可用 --base-url 指向它。
+  streamtest:
+    image: gsb-oom-doctor
+    build: .
+    profiles: ["selftest"]
+    depends_on:
+      - oom-doctor
+    command: ["python3", "scripts/streamtest.py", "--base-url", "http://oom-doctor:8000"]

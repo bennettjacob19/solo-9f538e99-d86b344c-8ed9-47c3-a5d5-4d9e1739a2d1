@@ -34,10 +34,15 @@
 ```bash
 docker compose up --build
 # 打开 http://127.0.0.1:8000/docs
+
+# 无 cgroup 条件的机器：切到模拟后端（接口与归因流程不变，OOM 由样例作业自查复现）
+GSB_SIMULATE=1 docker compose up --build
 ```
 
 compose 里 `mem_limit: 384m`（等值 `memswap_limit` 禁 swap）即“内存上限生效”。
 单轮上限 = (384 − 96 预留) / 2 = **144MiB**，见 `GET /status`。
+`GSB_SIMULATE=1` 时 `/status` 的 `mode` 为 `simulation`，仍正常接作业。
+`GET /docs` 里可直接调用全部接口（含 `GET /jobs` 的逐条响应）。
 
 ## 用法（/docs 里点，或 curl）
 
@@ -56,6 +61,9 @@ curl -s -X POST localhost:8000/jobs/<job_id>/stop
 
 # 4. 查归因
 curl -s localhost:8000/jobs/<job_id>
+
+# 5. 拉整晚全部记录（新的在前，逐条发送）
+curl -s localhost:8000/jobs
 ```
 
 返回字段：`exit_status`（subprocess 约定，-9 = SIGKILL）、`exit_signal`、
@@ -64,18 +72,39 @@ curl -s localhost:8000/jobs/<job_id>
 
 > 注意：Python 解释器自身开销（约 20–40MiB）也计入本轮 cgroup，选目标 MiB 时留余量。
 
+## `GET /jobs`：逐条发送的完整列表
+
+响应体仍是**原字段组成的 JSON 数组**，但服务不再等整份 JSON 拼完才发：
+
+- **按接单先后从新到旧**逐条编码、逐条写出（chunked 传输），首条记录无需
+  先扫完历史即可到达客户端。
+- **名单与证据以受理这次查询时为准**：受理即固定接单链头与各运行中作业的
+  记录快照；受理之后才接单的作业留到下次查询；发送期间才结束的作业仍返回
+  查询开始时的状态、归因与日志尾部（单条记录内部也不会半新半旧）。
+- **额外内存不随历史条数增长**：遍历只持有一个作业号，编码缓冲只放当前一条，
+  受理时的快照至多等于槽位数（默认 2）；不复制、不排序、不物化整份历史。
+- **与其他请求隔离**：慢读的客户端只拖住自己那条响应，`POST /jobs` 照常接单、
+  `POST /jobs/{id}/stop` 照常强停、槽位照常交还。
+- **断开即回收**：客户端中途断开时响应生成器被取消/关闭，`finally` 立即释放
+  本次查询的视图与快照；`GET /status` 的 `active_list_streams` 可观察在途查询数。
+
 ## 自测
 
 ```bash
 # 真实 cgroup 环境（推荐）：一轮 OOM 与一轮强停交错并行 + 槽位交还 + 正常退出
 docker compose run --rm selftest
 
+# GET /jobs 逐条发送：长列表、慢读、中途断开、受理时刻语义
+docker compose run --rm streamtest
+#   -> 对已运行的服务：python3 scripts/streamtest.py --base-url http://127.0.0.1:8000
+
 # 本机无特权环境：模拟后端跑通同一套流程（OOM 由样例作业按限制自查复现）
 GSB_SIMULATE=1 python3 -m uvicorn app.main:app &
 python3 scripts/selftest.py
+python3 scripts/streamtest.py            # 自起 in-process 服务 + 长历史
 
-# 归因真值表单测（纯 stdlib，无依赖）
-python3 -m unittest tests.test_verdict -v
+# 纯逻辑单测（归因真值表 + 逐条发送/受理时刻/内存/释放）
+python3 -m unittest tests.test_verdict tests.test_stream -v
 ```
 
 ## 环境变量
@@ -90,5 +119,7 @@ python3 -m unittest tests.test_verdict -v
 ## 已知边界
 
 - 作业记录保存在进程内存，重启即失；单 worker 运行。
+- `GET /jobs` 的名单在一次查询内固定：查询受理之后才接单的作业，要等下一次
+  查询才会出现。
 - 两轮同时都打满内存时，容器级 `memory.max` 可能先于 slot 级触发，
   此时 slot 计数不增、归因落 `unknown` —— 属“证据不足按不明处理”的预期行为。
